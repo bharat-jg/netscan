@@ -1,0 +1,11 @@
+# Python caches
+__pycache__/
+*.pyc
+core/__pycache__/
+
+# Local virtual environment
+.venv/
+
+# Generated scan outputs (keep folder, ignore files)
+data/*
+!data/.gitkeep
