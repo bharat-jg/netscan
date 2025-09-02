@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 class SNMPDevice:
     """Class to represent an SNMP device with all its information"""
-    
     def __init__(self, ip: str):
         self.ip = ip
         self.community = ""
@@ -45,6 +44,10 @@ class SNMPDevice:
         self.sys_descr = ""
         self.sys_object_id = ""
         self.vendor = ""
+        self.model = ""
+        self.serial_number = ""
+        self.dns_name = ""
+        self.interface_bandwidths = {}  # {interface_name: {'in_bps': int, 'out_bps': int}}
         self.last_updated = datetime.now()
 
 class SNMPScanner:
@@ -202,9 +205,10 @@ class SNMPScanner:
 
     def get_device_details(self, host: str, community: str) -> Optional[SNMPDevice]:
         """Get comprehensive device details"""
+        import socket
         device = SNMPDevice(host)
         device.community = community
-        
+
         # Get system information
         for name, oid in self.SYSTEM_OIDS.items():
             value = self.snmp_get(host, community, oid)
@@ -232,19 +236,15 @@ class SNMPScanner:
 
         # Get MAC addresses (robust): prefer raw OctetString via SNMP IF-MIB, fallback to local ARP
         mac_addresses: List[str] = []
-
-        # Try raw values from IF-MIB::ifPhysAddress
         try:
             raw_vals = self.snmp_walk_values(host, community, self.INTERFACE_OIDS['ifPhysAddress'])
             for v in raw_vals:
                 raw = None
-                # pysnmp OctetString has asOctets()
                 if hasattr(v, 'asOctets'):
                     try:
                         raw = v.asOctets()
                     except Exception:
                         raw = None
-                # If not available, try to parse from pretty string repr
                 if raw is None:
                     s = str(v)
                     if s.startswith('0x') and len(s) >= 14:
@@ -255,21 +255,16 @@ class SNMPScanner:
                     elif re.fullmatch(r'(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}', s):
                         mac_addresses.append(s.replace('-', ':').upper())
                         continue
-
                 if raw:
                     mac = self._format_mac_bytes(raw)
                     if mac:
                         mac_addresses.append(mac)
         except Exception:
             pass
-
-        # Fallback: resolve via local ARP cache for this host
         if not mac_addresses:
             fallback_mac = self._get_local_arp_mac(host)
             if fallback_mac:
                 mac_addresses.append(fallback_mac)
-
-        # Deduplicate while preserving order
         seen = set()
         de_duped = []
         for m in mac_addresses:
@@ -296,7 +291,6 @@ class SNMPScanner:
                     cpu_values.append(cpu_val)
             except:
                 pass
-        
         if cpu_values:
             device.cpu_usage = sum(cpu_values) / len(cpu_values)
 
@@ -326,7 +320,6 @@ class SNMPScanner:
         sys_descr_lower = device.sys_descr.lower()
         device.device_type = "Unknown Device"
         device.vendor = "Unknown"
-        
         for device_type, patterns in self.DEVICE_PATTERNS.items():
             for pattern in patterns:
                 if pattern in sys_descr_lower:
@@ -348,7 +341,122 @@ class SNMPScanner:
             if device.vendor != "Unknown":
                 break
 
+        # --- New fields: Model, Serial, DNS Name, Interface Bandwidth ---
+        # Model and Serial (ENTITY-MIB)
+        # Model: Try SNMP, then WMIC if localhost, else blank
+        model = self.get_device_model(host, community)
+        device.model = model
+
+        # Serial: Try SNMP, else extract from device_name if matches, else fallback to device_name
+        serial = self.get_device_serial(host, community)
+        if not serial:
+            # Try to extract serial from device_name (e.g., after dash or last part)
+            import re
+            dn = device.device_name
+            # Match after dash or last alphanumeric part
+            m = re.search(r'-([A-Za-z0-9]+)$', dn)
+            if m:
+                serial = m.group(1)
+            else:
+                # If no dash, try last word
+                parts = re.findall(r'[A-Za-z0-9]+', dn)
+                if parts:
+                    serial = parts[-1]
+                else:
+                    serial = dn
+        device.serial_number = serial
+
+        # DNS Name (reverse lookup)
+        try:
+            device.dns_name = socket.gethostbyaddr(host)[0]
+        except Exception:
+            device.dns_name = ""
+
+        # Restore interface bandwidths logic for troubleshooting
+        device.interface_bandwidths = self.get_interface_bandwidths(host, community)
+        if device.interface_bandwidths and all(
+            (v['in_bps'] == 0 and v['out_bps'] == 0) for v in device.interface_bandwidths.values()
+        ):
+            logger.debug(f"All interface bandwidths are zero for {host}. This is common on Windows or unsupported SNMP agents.")
+
         return device
+
+    def get_device_model(self, host: str, community: str) -> str:
+        """Try to get device model from ENTITY-MIB (entPhysicalModelName), fallback to sysDescr substring."""
+        # OID: 1.3.6.1.2.1.47.1.1.1.13 (walk all)
+        model_oids = self.snmp_walk(host, community, '1.3.6.1.2.1.47.1.1.1.13')
+        for oid, value in model_oids:
+            if value and value.strip() and value.lower() != 'unknown':
+                return value.strip()
+        # Fallback: try to extract model from sysDescr if possible
+        sys_descr = self.snmp_get(host, community, self.SYSTEM_OIDS['sysDescr'])
+        
+        if (host == '127.0.0.1' or host == 'localhost'):
+            try:
+                import platform
+                if platform.system().lower() == 'windows':
+                    wmic_out = subprocess.check_output(['wmic', 'csproduct', 'get', 'name'], encoding='utf-8', errors='ignore')
+                    lines = [l.strip() for l in wmic_out.splitlines() if l.strip() and 'Name' not in l]
+                    if lines:
+                        model = lines[0]
+            except Exception as e:
+                logger.debug(f"WMIC model fetch failed: {e}")
+
+        if sys_descr:
+            import re
+            m = re.search(r'(model|mod)\s*[:#]?\s*([\w\-]+)', sys_descr, re.I)
+            if m:
+                return m.group(2)
+        logger.debug(f"Model not found for {host}")
+        return ""
+
+    def get_device_serial(self, host: str, community: str) -> str:
+        """Try to get device serial number from ENTITY-MIB (entPhysicalSerialNum), fallback to sysDescr substring."""
+        serial_oids = self.snmp_walk(host, community, '1.3.6.1.2.1.47.1.1.1.11')
+        for oid, value in serial_oids:
+            if value and value.strip() and value.lower() != 'unknown':
+                return value.strip()
+        # Fallback: try to extract serial from sysDescr if possible
+        sys_descr = self.snmp_get(host, community, self.SYSTEM_OIDS['sysDescr'])
+        if sys_descr:
+            import re
+            m = re.search(r'(serial|sn)\s*[:#]?\s*([\w\-]+)', sys_descr, re.I)
+            if m:
+                return m.group(2)
+        logger.debug(f"Serial number not found for {host}")
+        return ""
+
+    def get_interface_bandwidths(self, host: str, community: str, interval_sec: int = 5) -> Dict[str, Dict[str, int]]:
+        """Get interface bandwidth usage (bps) for each interface (ifInOctets/ifOutOctets)."""
+        # OIDs: ifDescr (1.3.6.1.2.1.2.2.1.2), ifInOctets (1.3.6.1.2.1.2.2.1.10), ifOutOctets (1.3.6.1.2.1.2.2.1.16)
+        descrs = self.snmp_walk(host, community, '1.3.6.1.2.1.2.2.1.2')
+        in_octets1 = self.snmp_walk(host, community, '1.3.6.1.2.1.2.2.1.10')
+        out_octets1 = self.snmp_walk(host, community, '1.3.6.1.2.1.2.2.1.16')
+        time.sleep(interval_sec)  # Wait longer to measure bandwidth
+        in_octets2 = self.snmp_walk(host, community, '1.3.6.1.2.1.2.2.1.10')
+        out_octets2 = self.snmp_walk(host, community, '1.3.6.1.2.1.2.2.1.16')
+
+        def oid_idx(oid):
+            return oid.split('.')[-1]
+        descr_map = {oid_idx(oid): val for oid, val in descrs}
+        in1_map = {oid_idx(oid): int(val) for oid, val in in_octets1 if val.isdigit()}
+        in2_map = {oid_idx(oid): int(val) for oid, val in in_octets2 if val.isdigit()}
+        out1_map = {oid_idx(oid): int(val) for oid, val in out_octets1 if val.isdigit()}
+        out2_map = {oid_idx(oid): int(val) for oid, val in out_octets2 if val.isdigit()}
+
+        bandwidths = {}
+        for idx, name in descr_map.items():
+            try:
+                in_bps = int((in2_map.get(idx, 0) - in1_map.get(idx, 0)) * 8 / interval_sec)
+                out_bps = int((out2_map.get(idx, 0) - out1_map.get(idx, 0)) * 8 / interval_sec)
+                if in_bps < 0: in_bps = 0
+                if out_bps < 0: out_bps = 0
+                bandwidths[name] = {'in_bps': in_bps, 'out_bps': out_bps}
+            except Exception:
+                continue
+        if not bandwidths:
+            logger.debug(f"No interface bandwidths found for {host}")
+        return bandwidths
 
     def scan_single_device(self, host: str) -> Optional[SNMPDevice]:
         """Scan a single device"""
@@ -407,14 +515,13 @@ class SNMPScanner:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filepath = f"data/{filename}_{timestamp}.csv"
 
-        # Ensure maximum compatibility with Excel by using UTF-8 with BOM
         os.makedirs('data', exist_ok=True)
         with open(filepath, 'w', newline='', encoding='utf-8-sig') as csvfile:
             fieldnames = [
-                'IP Address', 'Device Name', 'Device Type', 'Vendor', 'MAC Addresses',
-                'OS Details', 'Status', 'CPU Usage (%)', 'Memory Usage (%)',
+                'IP Address', 'DNS Name', 'Device Name', 'Device Type', 'Vendor', 'Model', 'Serial Number',
+                'MAC Addresses', 'OS Details', 'Status', 'CPU Usage (%)', 'Memory Usage (%)',
                 'Total Memory (KB)', 'Uptime', 'Location', 'Contact',
-                'SNMP Community', 'Interfaces', 'Last Updated'
+                'SNMP Community', 'Interfaces', 'Interface Bandwidths', 'Last Updated'
             ]
 
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
@@ -423,9 +530,12 @@ class SNMPScanner:
             for device in devices:
                 writer.writerow({
                     'IP Address': device.ip,
+                    'DNS Name': device.dns_name,
                     'Device Name': device.device_name,
                     'Device Type': device.device_type,
                     'Vendor': device.vendor,
+                    'Model': device.model,
+                    'Serial Number': device.serial_number,
                     'MAC Addresses': ', '.join(device.mac_addresses),
                     'OS Details': device.os_details,
                     'Status': device.status,
@@ -436,7 +546,8 @@ class SNMPScanner:
                     'Location': device.location,
                     'Contact': device.contact,
                     'SNMP Community': device.community,
-                    'Interfaces': ', '.join(device.interfaces[:3]),  # Limit to first 3
+                    'Interfaces': ', '.join(device.interfaces[:3]),
+                    'Interface Bandwidths': str(device.interface_bandwidths),
                     'Last Updated': device.last_updated.strftime("%Y-%m-%d %H:%M:%S")
                 })
 
@@ -452,9 +563,12 @@ class SNMPScanner:
         for device in devices:
             device_dict = {
                 'ip_address': device.ip,
+                'dns_name': device.dns_name,
                 'device_name': device.device_name,
                 'device_type': device.device_type,
                 'vendor': device.vendor,
+                'model': device.model,
+                'serial_number': device.serial_number,
                 'mac_addresses': device.mac_addresses,
                 'os_details': device.os_details,
                 'status': device.status,
@@ -466,6 +580,7 @@ class SNMPScanner:
                 'contact': device.contact,
                 'snmp_community': device.community,
                 'interfaces': device.interfaces,
+                'interface_bandwidths': device.interface_bandwidths,
                 'sys_descr': device.sys_descr,
                 'sys_object_id': device.sys_object_id,
                 'last_updated': device.last_updated.isoformat()
